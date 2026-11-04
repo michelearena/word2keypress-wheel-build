@@ -1,0 +1,215 @@
+# TEMPLATE ONLY: outside .github/workflows; do not dispatch without authorization.
+# No checkout, secrets, model, dataset, or Passmory inputs.
+name: Build original word2keypress 1.0.16 for CPython 3.13.1 Windows
+'on':
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Compile unchanged original .pyx with Cython 3.0.11, or try bundled legacy C
+        required: true
+        default: cython-original-pyx
+        type: choice
+        options:
+        - cython-original-pyx
+        - original-c
+permissions:
+  contents: read
+jobs:
+  dependency:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - name: Use exact destination CPython version
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.13.1
+        architecture: x64
+    - name: Write standalone build and verification scripts; no repository checkout
+      run: |
+        @'
+        """Build the unchanged 1.0.16 sources; no model, passwords or Passmory data.
+
+        Default: original bundled C. --cython: compile the original .pyx, language
+        level 2, into a separate generated C file for newer CPython. Neither path
+        edits setup.py, .pyx, or the distributed .c. A wheel is not a generation PASS.
+        """
+        from pathlib import Path
+        import argparse
+        import hashlib
+        import json
+        import os
+        import runpy
+        import subprocess
+        import sys
+        import tarfile
+        import importlib.metadata as md
+
+        SHA = "d1cf380b4795e4c0071ce92d388224f910eee16135824151da8328f11be3ed04"
+
+
+        def sha(path):
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+        def main():
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--sdist", type=Path, required=True)
+            parser.add_argument("--work", type=Path, required=True)
+            parser.add_argument("--cython", action="store_true")
+            args = parser.parse_args()
+            archive, work = args.sdist.resolve(), args.work.resolve()
+            work.mkdir(parents=True, exist_ok=True)
+            assert sha(archive) == SHA, "Not the published original 1.0.16 source"
+            source = work / "source/word2keypress-1.0.16"
+            assert not source.exists(), "Use a fresh work directory; existing evidence must be retained"
+            with tarfile.open(archive) as tar:
+                tar.extractall(work / "source", filter="data")
+            before = {p.relative_to(source).as_posix(): sha(p) for p in source.rglob("*") if p.is_file()}
+            manifest = {"python": sys.version, "sourceSha256": SHA, "sourceFiles": before,
+                        "buildMode": "original-pyx-cython-language-level-2" if args.cython else "original-bundled-c",
+                        "packages": {name: md.version(name) for name in ["setuptools", "wheel", "pytest-runner"]}}
+            os.chdir(source)
+            import setuptools
+            from setuptools import Extension
+            original_setup = setuptools.setup
+
+            def setup(**kwargs):
+                if args.cython:
+                    import Cython
+                    manifest["cythonVersion"] = Cython.__version__
+                    assert Cython.__version__ == "3.0.11"
+                    generated = source / "build/generated_keyboard.c"
+                    generated.parent.mkdir(exist_ok=True)
+                    proc = subprocess.run([sys.executable, "-m", "cython", "-2", "-o", str(generated),
+                                           str(source / "src/word2keypress/_keyboard.pyx")], capture_output=True, text=True)
+                    (work / "cython.stdout.txt").write_text(proc.stdout, encoding="utf-8")
+                    (work / "cython.stderr.txt").write_text(proc.stderr, encoding="utf-8")
+                    manifest["translationReturnCode"] = proc.returncode
+                    proc.check_returncode()
+                    manifest["generatedCSha256"] = sha(generated)
+                    kwargs["ext_modules"] = [Extension("word2keypress._keyboard", sources=["build/generated_keyboard.c"])]
+                return original_setup(**kwargs)
+
+            setuptools.setup = setup
+            sys.argv = [str(source / "setup.py"), "bdist_wheel", "--dist-dir", str(work / "wheels")]
+            code = 0
+            try:
+                runpy.run_path(str(source / "setup.py"), run_name="__main__")
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+                manifest["buildError"] = str(exc)
+                if code:
+                    print(str(exc), file=sys.stderr)
+            except Exception as exc:
+                code = 1
+                manifest["buildError"] = repr(exc)
+                raise
+            finally:
+                manifest["returnCode"] = code
+                changed = [p for p, h in before.items() if not (source / p).exists() or sha(source / p) != h]
+                manifest["changedDistributionMetadata"] = [p for p in changed if ".egg-info/" in p]
+                manifest["originalSourceUnchanged"] = not [p for p in changed if ".egg-info/" not in p]
+                manifest["wheels"] = {p.name: sha(p) for p in (work / "wheels").glob("*.whl")}
+                (work / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+                assert manifest["originalSourceUnchanged"], "Source changed during build"
+            return code
+
+
+        if __name__ == "__main__":
+            raise SystemExit(main())
+        '@ | Set-Content -LiteralPath build_word2keypress.py -Encoding utf8
+        @'
+        """Dependency-only wheel verification; no real credentials or model data."""
+        from pathlib import Path
+        import hashlib
+        import importlib.metadata as md
+        import json
+        import string
+        import sys
+
+
+        def main():
+            assert md.version("word2keypress") == "1.0.16"
+            from word2keypress import Keyboard
+            import word2keypress._keyboard as native
+            extension = Path(native.__file__)
+            assert extension.suffix == ".pyd", "Expected a compiled Windows extension"
+            kb = Keyboard()
+            values = list(string.ascii_letters + string.digits + string.punctuation + " ")
+            # Fixed exhaustive ASCII characters plus deterministic combinations of shifts/caps.
+            values += [string.ascii_lowercase, string.ascii_uppercase, string.digits, string.punctuation,
+                       string.ascii_lowercase + string.ascii_uppercase, "aA!1", "Aa!1", "ABCdef", "aBCDef"]
+            rows = []
+            for text in values:
+                sequence = kb.word_to_keyseq(text)
+                decoded = kb.keyseq_to_word(sequence)
+                assert decoded == text, (repr(text), repr(sequence), repr(decoded))
+                assert kb.word_to_keyseq(text) == sequence
+                rows.append({"input": text, "keySequence": sequence, "decoded": decoded})
+            assert kb.word_to_keyseq("a") == "a"
+            assert kb.word_to_keyseq("A") == chr(3) + "a"
+            assert kb.word_to_keyseq("!") == chr(3) + "1"
+            result = {"status": "DEPENDENCY_SMOKE_PASS", "python": sys.version, "version": md.version("word2keypress"),
+                      "extension": str(extension), "extensionSha256": hashlib.sha256(extension.read_bytes()).hexdigest(),
+                      "checks": rows, "scope": "ASCII smoke and explicit shift mappings; not model generation or full legacy-runtime equivalence"}
+            Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+
+        if __name__ == "__main__":
+            main()
+        '@ | Set-Content -LiteralPath verify_keyboard.py -Encoding utf8
+    - name: Fetch and verify only the published dependency
+      run: |
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Path artifacts | Out-Null
+        Invoke-WebRequest -Uri 'https://files.pythonhosted.org/packages/f1/31/fe02ab3dc90b7d39869fb3ec89c60b855773ed3b05ec90929aa22a146f26/word2keypress-1.0.16.tar.gz' -OutFile artifacts/word2keypress-1.0.16.tar.gz
+        $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath artifacts/word2keypress-1.0.16.tar.gz).Hash.ToLowerInvariant()
+        if ($digest -ne 'd1cf380b4795e4c0071ce92d388224f910eee16135824151da8328f11be3ed04') { throw 'Source digest mismatch' }
+        python -m venv build-env
+        & ./build-env/Scripts/python.exe -m pip install --disable-pip-version-check 'setuptools==75.8.2' 'wheel==0.45.1' 'pytest-runner==6.0.1' 'Cython==3.0.11' *> artifacts/tools-install.log
+        if ($LASTEXITCODE -ne 0) { throw 'Build tools install failed' }
+        & ./build-env/Scripts/python.exe -m pip freeze --all > artifacts/build-environment.txt
+    - name: Build wheel without editing library code
+      env:
+        BUILD_MODE: ${{ inputs.build_mode }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $buildArgs = @('build_word2keypress.py', '--sdist', 'artifacts/word2keypress-1.0.16.tar.gz', '--work', 'artifacts/build')
+        if ($env:BUILD_MODE -eq 'cython-original-pyx') { $buildArgs += '--cython' }
+        & ./build-env/Scripts/python.exe @buildArgs *> artifacts/build.log
+        if ($LASTEXITCODE -ne 0) { throw 'Original dependency compilation failed; retain logs and manifest' }
+    - name: Verify installed compiled wheel in a fresh environment
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $wheels = @(Get-ChildItem -LiteralPath artifacts/build/wheels -Filter '*.whl')
+        if ($wheels.Count -ne 1) { throw 'Expected exactly one wheel' }
+        if ($wheels[0].Name -ne 'word2keypress-1.0.16-cp313-cp313-win_amd64.whl') { throw 'Unexpected wheel version or ABI' }
+        python -m venv verification-env
+        & ./verification-env/Scripts/python.exe -m pip install --no-index --no-deps $wheels[0].FullName *> artifacts/wheel-install.log
+        if ($LASTEXITCODE -ne 0) { throw 'Wheel installation failed' }
+        & ./verification-env/Scripts/python.exe verify_keyboard.py artifacts/KEYBOARD-VERIFICATION.json *> artifacts/verification.log
+        if ($LASTEXITCODE -ne 0) { throw 'Keyboard verification failed' }
+        & ./verification-env/Scripts/python.exe -m pip freeze --all > artifacts/verification-environment.txt
+    - name: Seal source, wheel and logs even on failure
+      if: always()
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (Test-Path -LiteralPath artifacts) {
+          $base = (Resolve-Path -LiteralPath artifacts).Path
+          $lines = Get-ChildItem -LiteralPath $base -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object FullName | ForEach-Object {
+            $relative = [System.IO.Path]::GetRelativePath($base, $_.FullName).Replace('\', '/')
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() + '  ' + $relative
+          }
+          $lines | Set-Content -LiteralPath artifacts/SHA256SUMS.txt -Encoding utf8
+        }
+    - name: Retain dependency-only evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: word2keypress-1.0.16-cp313-win_amd64-evidence
+        path: artifacts/
+        if-no-files-found: error
+        retention-days: 14
